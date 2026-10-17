@@ -46,7 +46,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 FIELDS = ["mode", "page_id", "paper_id", "page", "bucket", "base_size", "image_size",
           "crop_mode", "num_crops", "hook_crops", "measured_visual_tokens", "token_source",
-          "pred_path", "gold_paper", "gen_seconds", "pred_chars"]
+          "pred_path", "gold_paper", "gen_seconds", "pred_chars",
+          "max_new_tokens", "hit_cap"]
 
 CONFIGS: Dict[str, dict] = {
     "Compact": dict(base_size=768,  image_size=768,  crop_mode=False),
@@ -87,6 +88,37 @@ def trim_per_bucket(rows: List[dict], per_bucket: int) -> List[dict]:
             s.add(r["paper_id"])
     kept = {p for s in keep.values() for p in s}
     return [r for r in rows if r["paper_id"] in kept]
+
+
+def ensure_runs_schema(runs_path: str) -> None:
+    """Create runs.csv, or widen its header in place when FIELDS grows.
+
+    Appending wider rows to a narrower header would silently corrupt the file, so
+    existing rows are rewritten with empty values for the new columns.
+    """
+    if not os.path.exists(runs_path):
+        os.makedirs(os.path.dirname(runs_path) or ".", exist_ok=True)
+        with open(runs_path, "w", newline="", encoding="utf-8") as fh:
+            csv.DictWriter(fh, fieldnames=FIELDS).writeheader()
+            fh.flush(); os.fsync(fh.fileno())
+        return
+    with open(runs_path, newline="", encoding="utf-8", errors="replace") as fh:
+        reader = csv.DictReader(fh)
+        header = reader.fieldnames or []
+        rows = list(reader)
+    if header == FIELDS:
+        return
+    merged = list(FIELDS) + [f for f in header if f not in FIELDS]
+    tmp = runs_path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=merged, extrasaction="ignore")
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: row.get(k, "") for k in merged})
+        fh.flush(); os.fsync(fh.fileno())
+    os.replace(tmp, runs_path)
+    log("[runs] migrated header: +%s (%d rows kept)"
+        % (", ".join(f for f in FIELDS if f not in header) or "reordered", len(rows)))
 
 
 def load_done(runs_path: str) -> set:
@@ -385,11 +417,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                     image_size=cfg["image_size"])
         return len(blocks), "dynamic_preprocess"
 
-    if not os.path.exists(runs_path):
-        os.makedirs(os.path.dirname(runs_path) or ".", exist_ok=True)
-        with open(runs_path, "w", newline="", encoding="utf-8") as fh:
-            csv.DictWriter(fh, fieldnames=FIELDS).writeheader()
-            fh.flush(); os.fsync(fh.fileno())
+    ensure_runs_schema(runs_path)
 
     failures = 0
     ran = 0
@@ -438,6 +466,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "pred_path": dest,
                 "gold_paper": os.path.join(data_dir, gold_rel) if gold_rel else "",
                 "gen_seconds": round(time.time() - t0, 2), "pred_chars": len(text),
+                "max_new_tokens": args.max_new_tokens or "",
+                # ~3.5 chars/token for LaTeX; a page within 5% of the cap was cutting off
+                "hit_cap": int(bool(args.max_new_tokens)
+                               and len(text) / 3.5 >= 0.95 * args.max_new_tokens),
             })
             fh.flush(); os.fsync(fh.fileno())
         ran += 1
