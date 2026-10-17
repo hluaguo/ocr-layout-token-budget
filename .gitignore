@@ -1,0 +1,9 @@
+data/
+outputs/
+*.pdf
+*.png
+!figs/*.png
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+.env
