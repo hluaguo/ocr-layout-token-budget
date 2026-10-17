@@ -217,6 +217,92 @@ def build_model(model_id: str, attn: str, dtype: str, max_new_tokens: Optional[i
     return torch, tok, model, mod
 
 
+def infer_page(model, tok, image_path: str, cfg: dict) -> str:
+    """One generation. eval_mode is mandatory: the other paths return None."""
+    text = model.infer(
+        tok, prompt=PROMPT, image_file=image_path,
+        output_path="/tmp/ds_out",     # infer() makedirs() this unconditionally
+        base_size=cfg["base_size"],    # explicit: model default is 640
+        image_size=cfg["image_size"],
+        crop_mode=cfg["crop_mode"],
+        test_compress=False,
+        save_results=False,
+        eval_mode=True,
+    )
+    if isinstance(text, (list, tuple)):
+        text = text[0] if text else ""
+    return text or ""
+
+
+def _self_test() -> int:
+    """Exercise plan -> generate -> append -> resume with a stub model (no GPU)."""
+    import tempfile
+    import types
+
+    fails = []
+
+    def check(name, cond, extra=""):
+        if not cond:
+            fails.append("%s %s" % (name, extra))
+
+    fake_mod = types.ModuleType("fake_ocr")
+    fake_mod.dynamic_preprocess = lambda im, **kw: [0] * 6
+    sys.modules["fake_ocr"] = fake_mod
+
+    class FakeModel:
+        def infer(self, tok, **kw):
+            return "\\section{Intro}\nBody text."
+
+    FakeModel.__module__ = "fake_ocr"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        data = os.path.join(tmp, "data")
+        os.makedirs(os.path.join(data, "images"))
+        os.makedirs(os.path.join(data, "paper_gold"))
+        for name in ("paper_gold/2501.00001.tex",):
+            with open(os.path.join(data, name), "w") as fh:
+                fh.write("\\section{Intro} Body text.")
+        pages = []
+        for page in (1, 2):
+            page_id = "2501.00001_p%03d" % page
+            img = os.path.join(data, "images", page_id + ".png")
+            with open(img, "wb") as fh:
+                fh.write(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+            pages.append({"page_id": page_id, "paper_id": "2501.00001v1", "page": page,
+                          "n_pages": 2, "bucket": "table_heavy",
+                          "image": os.path.join("images", page_id + ".png"),
+                          "paper_gold": "paper_gold/2501.00001.tex"})
+        with open(os.path.join(data, "pages.jsonl"), "w") as fh:
+            for p in pages:
+                fh.write(json.dumps(p) + "\n")
+
+        runs = os.path.join(tmp, "runs.csv")
+        original = globals()["build_model"]
+        globals()["build_model"] = lambda *a, **k: (object(), object(), FakeModel(), fake_mod)
+        try:
+            rc = main(["--work", tmp, "--data", data, "--runs", runs, "--modes", "Compact",
+                       "--limit", "2", "--papers-per-bucket", "1"])
+        finally:
+            globals()["build_model"] = original
+
+        check("rc", rc == 0, str(rc))
+        rows = list(csv.DictReader(open(runs, encoding="utf-8")))
+        check("rows_written", len(rows) == 2, str(len(rows)))
+        if rows:
+            r0 = rows[0]
+            check("row_mode", r0["mode"] == "Compact", r0["mode"])
+            check("row_gold_key", r0["gold_paper"].endswith("2501.00001.tex"), r0["gold_paper"])
+            check("row_tokens", r0["measured_visual_tokens"] == "144", r0["measured_visual_tokens"])
+            check("row_chars", int(r0["pred_chars"]) > 0, r0["pred_chars"])
+            check("tex_written", os.path.exists(r0["pred_path"]), r0["pred_path"])
+        check("resume_skips", len(load_done(runs)) == 2, str(load_done(runs)))
+
+    print("sweep self-test: %d failed" % len(fails))
+    for f in fails:
+        print("  FAIL", f)
+    return 1 if fails else 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -234,9 +320,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--attn", default="eager", help="eager | flash_attention_2")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--max-new-tokens", type=int, default=None)
+    ap.add_argument("--self-test", action="store_true",
+                    help="stub model, temp data: checks plan/generate/append/resume")
     ap.add_argument("--hook", action="store_true",
                     help="also cross-check crop counts with a vision-tower hook")
     args = ap.parse_args(argv)
+
+    if args.self_test:
+        return _self_test()
 
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     for m in modes:
@@ -283,13 +374,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 m.register_forward_hook(_hook)
                 log("[model] hook on %s" % attr)
 
-    from PIL import Image
-
     def crop_count(image_path: str, cfg: dict) -> Tuple[int, str]:
         if not cfg["crop_mode"]:
             return 0, "no_crop"
         if dynamic_preprocess is None:
             return N_CROP_MAX, "assumed_max"
+        from PIL import Image          # only needed for crop modes
         im = Image.open(image_path).convert("RGB")
         blocks = dynamic_preprocess(im, min_num=N_CROP_MIN, max_num=N_CROP_MAX,
                                     image_size=cfg["image_size"])
@@ -315,19 +405,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         hook_state["n_crops"] = None
         t0 = time.time()
         try:
-            text = model.infer(
-                tok, prompt=PROMPT, image_file=img,
-                output_path="/tmp/ds_out",     # infer() makedirs() this unconditionally
-                base_size=cfg["base_size"],    # explicit: model default is 640
-                image_size=cfg["image_size"],
-                crop_mode=cfg["crop_mode"],
-                test_compress=False,
-                save_results=False,
-                eval_mode=True,                # otherwise it streams and returns None
-            )
-            if isinstance(text, (list, tuple)):
-                text = text[0] if text else ""
-            text = text or ""
+            text = infer_page(model, tok, img, cfg)
         except Exception:
             failures += 1
             log("FAIL %s %s" % (mode, page["page_id"]))
