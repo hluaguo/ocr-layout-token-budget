@@ -33,6 +33,19 @@ concatenation of the paper's top-level sections. So:
 Sampling a single page out of ten would inject ~90% edit distance from the nine
 un-sampled pages, which is why whole papers are sampled (6-10 gapless pages each).
 
+## Run the sweep on Colab
+
+Colab opens a single notebook, not a repo — the other files arrive from the setup cells.
+
+1. Open <https://colab.research.google.com/github/hluaguo/ocr-layout-token-budget/blob/main/notebooks/sweep.ipynb>
+   (or *File → Upload notebook* to use a local copy).
+2. **Runtime → Change runtime type → L4 GPU.**
+3. Put `data.tar.gz` (built with `tar -czf data.tar.gz data/`) in
+   `MyDrive/ocr-layout-budget/` — the notebook untars it and clones this repo into
+   `/content/ocr-layout-token-budget`.
+4. Run cells 1–6 in order. Cell 5 is the sweep and ships with `RUN_LIMIT = 3` for the
+   smoke test; cell 6 asserts the three rows are non-empty before you raise it.
+
 ## Reproduce
 
 ```bash
