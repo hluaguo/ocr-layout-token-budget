@@ -53,6 +53,15 @@ python3 scripts/score.py --self-test
 Compile results are only comparable at a fixed preamble: the wrapper's SHA is
 printed by the self-test and recorded in `scores_meta.json`.
 
+## Known caveats
+
+- `infer()` needs `eval_mode=True` (otherwise it streams and returns `None`) and a non-empty
+  `output_path` (it calls `os.makedirs` unconditionally) — both are pinned in the notebook.
+- `eval_mode` decodes with `no_repeat_ngram_size=35`; the repo's interactive path uses `20`.
+  Numbers are therefore close to, not bit-identical with, the released demo.
+- `max_new_tokens=8192`: a very dense Gundam page can hit the cap, so `pred_chars` is worth
+  eyeballing for truncation before trusting a low NED.
+
 ## Dataset facts worth knowing
 
 - 14 figure archives, 13,367 page renders across 1,000 papers; 978 annotation JSONs.

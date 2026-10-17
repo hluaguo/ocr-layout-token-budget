@@ -1,9 +1,11 @@
-data/
-outputs/
+__pycache__/
+!figs/*.png
+.env
+.ipynb_checkpoints/
 *.pdf
 *.png
-!figs/*.png
-.ipynb_checkpoints/
-__pycache__/
 *.pyc
-.env
+*.tar.gz
+data.tar.gz
+data/
+outputs/
