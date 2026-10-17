@@ -330,6 +330,9 @@ class Row:
     vision_tokens: int
     pred_path: str
     gold_path: str
+    paper_id: str = ""
+    page: int = 0
+    gold_paper: str = ""      # paper_gold/<id>.tex: what TexOCR's harness compares to
 
 
 def _read_text(path: str) -> str:
@@ -377,8 +380,108 @@ def load_runs(path: str) -> List[Row]:
                 vision_tokens=int(float(r.get("vision_tokens") or 0)),
                 pred_path=(r.get("pred_path") or "").strip(),
                 gold_path=(r.get("gold_path") or "").strip(),
+                paper_id=(r.get("paper_id") or "").strip(),
+                page=int(float(r.get("page") or 0)),
+                gold_paper=(r.get("gold_paper") or "").strip(),
             ))
     return rows
+
+
+def load_pages_index(path: str) -> dict:
+    """pages.jsonl from build_pages.py -> page_id -> {paper_id, page, bucket, paper_gold}."""
+    out = {}
+    if not path:
+        return out
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            out[row["page_id"]] = row
+    return out
+
+
+def attach_paper_metadata(rows: List[Row], index: dict, base_dir: str = "") -> int:
+    """Fill paper_id/page/gold_paper from pages.jsonl, keeping whatever runs.csv had.
+
+    `pages.jsonl` stores `paper_gold` and `image` relative to its own directory.
+    """
+    filled = 0
+    for r in rows:
+        meta = index.get(r.page_id)
+        if not meta:
+            continue
+        r.paper_id = r.paper_id or meta.get("paper_id", "")
+        r.page = r.page or int(meta.get("page", 0))
+        r.bucket = r.bucket or meta.get("bucket", "")
+        if not r.gold_paper and meta.get("paper_gold"):
+            r.gold_paper = os.path.join(base_dir, meta["paper_gold"])
+        filled += 1
+    return filled
+
+
+def group_by_paper(rows: List[Row], records: List[dict], do_compile: bool) -> List[dict]:
+    """Concatenate each paper's pages in page order, exactly as TexOCR does.
+
+    Their harness sorts a paper's outputs by page number and does `all_text +=
+    processed_text` with no separator, then compares against the concatenation of
+    the paper's top-level `section_set` entries. We do the same, so NED here is
+    comparable to their `edit_distance` metric.
+    """
+    by_page = {r.page_id: r for r in rows}
+    buckets = {}
+    for rec in records:
+        row = by_page.get(rec["page_id"])
+        if row is None or not row.paper_id:
+            continue
+        buckets.setdefault((row.paper_id, row.mode), []).append((row.page, rec, row))
+
+    out = []
+    for (paper_id, mode), items in sorted(buckets.items()):
+        items.sort(key=lambda x: x[0])
+        pred = "".join(_read_text(r.pred_path) for _, _, r in items)
+        gold_path = next((r.gold_paper for _, _, r in items if r.gold_paper), "")
+        gold = _read_text(gold_path) if gold_path else ""
+        tabs = check_tabulars(pred)
+        rec = {
+            "mode": mode, "paper_id": paper_id,
+            "bucket": items[0][2].bucket,
+            "n_pages": len(items),
+            "pages_scored": ",".join(str(p) for p, _, _ in items),
+            "vision_tokens_mean": round(sum(i[1]["vision_tokens"] for i in items) / len(items)),
+            "pred_chars": len(pred), "gold_chars": len(gold),
+            "ned": round(ned(strip_latex(gold), strip_latex(pred)), 6) if gold else None,
+            "compile_ok": None,
+            "tab_total": tabs.total, "tab_ok": tabs.ok,
+            "tab_parity": None if tabs.parity is None else round(tabs.parity, 6),
+        }
+        if do_compile:
+            cres = compile_tex(pred)
+            rec["compile_ok"] = cres["ok"]
+            if cres["ok"] is False:
+                rec["compile_log"] = cres["log_tail"].replace("\n", " | ")[-400:]
+        out.append(rec)
+    return out
+
+
+def summarise_paper(records: List[dict]) -> str:
+    by = {}
+    for r in records:
+        by.setdefault((r["bucket"], r["mode"]), []).append(r)
+    lines = ["bucket,mode,n_papers,pages_mean,ned_mean,compile_rate,tab_parity_mean"]
+    for (bucket, mode), rs in sorted(by.items()):
+        n = len(rs)
+        neds = [x["ned"] for x in rs if x["ned"] is not None]
+        comps = [x["compile_ok"] for x in rs if x["compile_ok"] is not None]
+        pars = [x["tab_parity"] for x in rs if x["tab_parity"] is not None]
+        lines.append("%s,%s,%d,%.1f,%s,%s,%s" % (
+            bucket, mode, n, sum(x["n_pages"] for x in rs) / n,
+            "%.4f" % (sum(neds) / len(neds)) if neds else "",
+            "%.4f" % (sum(1 for c in comps if c) / len(comps)) if comps else "",
+            "%.4f" % (sum(pars) / len(pars)) if pars else "",
+        ))
+    return "\n".join(lines)
 
 
 def summarise(records: List[dict]) -> str:
@@ -407,8 +510,10 @@ def summarise(records: List[dict]) -> str:
 
 def self_test() -> int:
     fails = []
+    counted = [0]
 
     def check(name, cond, extra=""):
+        counted[0] += 1
         if not cond:
             fails.append("%s %s" % (name, extra))
 
@@ -454,6 +559,41 @@ a & b \\
     rep = check_tabulars(unterminated)
     check("tab_unterminated", any("unbalanced" in p for p in rep.problems), str(rep.problems))
 
+    # paper-level aggregation: order, exact concatenation, gold lookup
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        os.makedirs(os.path.join(td, "gold"))
+        with open(os.path.join(td, "gold", "p1.tex"), "w", encoding="utf-8") as fh:
+            fh.write("FIRSTSECOND")
+        # written out of page order on purpose
+        for name, body in (("p1_p002", "SECOND"), ("p1_p001", "FIRST")):
+            with open(os.path.join(td, name + ".tex"), "w", encoding="utf-8") as fh:
+                fh.write(body)
+        with open(os.path.join(td, "pages.jsonl"), "w", encoding="utf-8") as fh:
+            for pid, page in (("p1_p001", 1), ("p1_p002", 2)):
+                fh.write(json.dumps({"page_id": pid, "paper_id": "p1", "page": page,
+                                     "bucket": "mixed_layout",
+                                     "paper_gold": "gold/p1.tex",
+                                     "image": "images/%s.png" % pid}) + "\n")
+        with open(os.path.join(td, "runs.csv"), "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["mode", "page_id", "bucket", "vision_tokens", "pred_path", "gold_path"])
+            for pid in ("p1_p001", "p1_p002"):
+                w.writerow(["Base", pid, "", 256, os.path.join(td, pid + ".tex"), ""])
+        out_csv = os.path.join(td, "scores.csv")
+        rc = main(["--runs", os.path.join(td, "runs.csv"), "--out", out_csv,
+                   "--pages", os.path.join(td, "pages.jsonl"), "--group-by", "paper",
+                   "--no-compile", "--jobs", "1"])
+        check("paper_main_rc", rc == 0, str(rc))
+        rows_p = list(csv.DictReader(open(os.path.join(td, "scores_paper.csv"), encoding="utf-8")))
+        check("paper_rows", len(rows_p) == 1, str(len(rows_p)))
+        if rows_p:
+            r0 = rows_p[0]
+            check("paper_n_pages", r0["n_pages"] == "2", r0["n_pages"])
+            check("paper_order", r0["pages_scored"] == "1,2", r0["pages_scored"])
+            check("paper_ned_zero", float(r0["ned"]) == 0.0, r0["ned"])
+            check("paper_compile_null", r0["compile_ok"] == "", r0["compile_ok"])
+
     # compile test availability is environment-dependent; only assert the shape
     res = compile_tex(r"hello")
     check("compile_shape", set(res) >= {"ok", "exit_code", "log_tail", "pdf_bytes"}, str(res))
@@ -461,7 +601,7 @@ a & b \\
         check("compile_ok_true", compile_tex(r"$a^2+b^2=c^2$")["ok"] is True)
         check("compile_ok_false", compile_tex(r"\begin{tabular}{ll} a & b \\")["ok"] is False)
 
-    print("self-test: %d checks, %d failed" % (13, len(fails)))
+    print("self-test: %d checks, %d failed" % (counted[0], len(fails)))
     for f in fails:
         print("  FAIL", f)
     print("  pdflatex:", "found" if have_pdflatex() else "NOT FOUND (compile metric will be null)")
@@ -481,6 +621,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--out", default="scores.csv")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--no-compile", action="store_true")
+    ap.add_argument("--pages", help="pages.jsonl from build_pages.py (joins paper_id/page/gold)")
+    ap.add_argument("--group-by", choices=["none", "paper"], default="none",
+                    help="paper: also concatenate each paper's pages and score paper-level NED/compile")
     ap.add_argument("--keep-tex", action="store_true", help="keep wrapped .tex next to pdflatex logs")
     args = ap.parse_args(argv)
 
@@ -491,6 +634,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     rows = load_runs(args.runs)
+    if args.pages:
+        index = load_pages_index(args.pages)
+        filled = attach_paper_metadata(rows, index, os.path.dirname(os.path.abspath(args.pages)))
+        print("joined %d/%d rows to %s" % (filled, len(rows), args.pages), file=sys.stderr)
+        if filled < len(rows):
+            print("  ! %d rows have no page metadata (paper-level pass will skip them)"
+                  % (len(rows) - filled), file=sys.stderr)
     print("scoring %d outputs (compile=%s, jobs=%d, template=%s)"
           % (len(rows), not args.no_compile, args.jobs, TEMPLATE_SHA), file=sys.stderr)
     records: List[dict] = []
@@ -515,7 +665,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("\n" + summary, file=sys.stderr)
     print("\nwrote %s and %s" % (args.out, summary_csv), file=sys.stderr)
 
+    paper_csv = None
+    if args.group_by == "paper":
+        paper_records = group_by_paper(rows, records, not args.no_compile)
+        paper_csv = os.path.splitext(args.out)[0] + "_paper.csv"
+        cols_p = ["mode", "paper_id", "bucket", "n_pages", "pages_scored", "vision_tokens_mean",
+                  "pred_chars", "gold_chars", "ned", "compile_ok", "tab_total", "tab_ok",
+                  "tab_parity", "compile_log"]
+        with open(paper_csv, "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=cols_p, extrasaction="ignore")
+            w.writeheader()
+            for rec in paper_records:
+                w.writerow(rec)
+        paper_summary = os.path.splitext(args.out)[0] + "_paper_summary.csv"
+        with open(paper_summary, "w", encoding="utf-8") as fh:
+            fh.write(summarise_paper(paper_records) + "\n")
+        print("\n[paper level] " + summarise_paper(paper_records).replace("\n", "\n  ")
+              if paper_records else "\n[paper level] no papers grouped", file=sys.stderr)
+        print("wrote %s and %s" % (paper_csv, paper_summary), file=sys.stderr)
+
     meta = {"template_sha": TEMPLATE_SHA, "pdflatex": have_pdflatex(),
+            "group_by": args.group_by, "paper_csv": paper_csv,
             "edit_distance_backend": "rapidfuzz" if _HAVE_RF else "difflib",
             "n_rows": len(records), "compile_metric": not args.no_compile}
     meta_path = os.path.splitext(args.out)[0] + "_meta.json"
