@@ -12,7 +12,7 @@ Measured on [TexOCR](https://arxiv.org/abs/2604.22880) eval pages (CC BY 4.0) wi
 - **y-axis** = text **NED** against whole-paper gold, plus `pdflatex` pass rate
   and tabular well-formedness (merged/duplicated columns).
 - **n** = 30 complete papers / 236 pages, 3 buckets (table-heavy, math-heavy,
-  mixed-layout) x 3 native modes (Base 256, Large 400, Gundam 256 + n x 144).
+  mixed-layout) x 3 supported modes (Compact 144, Base 256, Gundam 256 + n x 144).
 
 <!-- plots land here -->
 <!-- ![budget vs layout](figs/budget_vs_layout.png) -->
@@ -68,6 +68,10 @@ printed by the self-test and recorded in `scores_meta.json`.
 
 ## Known caveats
 
+- **DeepEncoder V2 only supports 144 and 256 visual tokens** (`deepencoderv2.py` defines query
+  banks for exactly those two sizes). The 400-token `Large` mode from DeepSeek-OCR v1 raises
+  `UnboundLocalError: param_img` on OCR-2, so the sweep uses Compact (768 px, 144 tokens),
+  Base (1024 px, 256 tokens) and Gundam (256 + n x 144).
 - `infer()` needs `eval_mode=True` (otherwise it streams and returns `None`) and a non-empty
   `output_path` (it calls `os.makedirs` unconditionally) — both are pinned in the notebook.
 - `eval_mode` decodes with `no_repeat_ngram_size=35`; the repo's interactive path uses `20`.
