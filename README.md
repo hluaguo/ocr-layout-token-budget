@@ -33,6 +33,26 @@ concatenation of the paper's top-level sections. So:
 Sampling a single page out of ten would inject ~90% edit distance from the nine
 un-sampled pages, which is why whole papers are sampled (6-10 gapless pages each).
 
+## Scripts are the interface
+
+The notebook is a launcher; everything else is a CLI, so updating code never means
+re-pasting cells:
+
+```bash
+# terminal in Colab (or any shell with a GPU)
+git -C /content/ocr-layout-token-budget pull
+
+python scripts/sweep.py --dry-run                  # plan + ETA, no model, no GPU
+python scripts/sweep.py --smoke                    # 1 page x 3 modes
+python scripts/sweep.py --papers-per-bucket 2 --limit 120    # resumable session chunk
+python scripts/score.py --runs runs.csv --pages data/pages.jsonl \
+       --group-by paper --out scores.csv --jobs 8              # page + paper level
+python scripts/plot.py --work .                            # figs/budget_vs_layout.png
+```
+
+`--disconnect`-safe: every generation is appended and fsynced to `runs.csv`, and a
+re-run skips completed `(mode, page_id)` pairs, so a session chunk is just `--limit`.
+
 ## Run the sweep on Colab
 
 Colab opens a single notebook, not a repo — the other files arrive from the setup cells.
