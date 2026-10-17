@@ -348,6 +348,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 % (blocks, hook_crops, page["page_id"]))
         tokens = view_tokens(cfg, blocks)
 
+        # pages.jsonl calls it `paper_gold`; runs.csv keeps the scorer's `gold_paper`
+        gold_rel = page.get("paper_gold") or page.get("gold_paper") or ""
         with open(runs_path, "a", newline="", encoding="utf-8") as fh:
             csv.DictWriter(fh, fieldnames=FIELDS).writerow({
                 "mode": mode, "page_id": page["page_id"], "paper_id": page["paper_id"],
@@ -355,7 +357,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "base_size": cfg["base_size"], "image_size": cfg["image_size"],
                 "crop_mode": cfg["crop_mode"], "num_crops": blocks, "hook_crops": hook_crops,
                 "measured_visual_tokens": tokens, "token_source": source,
-                "pred_path": dest, "gold_paper": os.path.join(data_dir, page["gold_paper"]),
+                "pred_path": dest,
+                "gold_paper": os.path.join(data_dir, gold_rel) if gold_rel else "",
                 "gen_seconds": round(time.time() - t0, 2), "pred_chars": len(text),
             })
             fh.flush(); os.fsync(fh.fileno())
